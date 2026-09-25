@@ -1,0 +1,66 @@
+[project]
+name = "agentplat"
+version = "0.1.0"
+description = "A safe runtime for tool-using LLM agents: permissions, approvals, tracing, evaluation"
+readme = "README.md"
+authors = [
+    { name = "Chaitanya Mhetre", email = "mhetrechaitanya06@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "prometheus-client>=0.26.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "pyyaml>=6.0.3",
+    "redis>=8.1.0",
+    "sqlalchemy[asyncio]>=2.1.0",
+    "sse-starlette>=3.4.11",
+    "typer>=0.27.2",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.9",
+    "types-pyyaml>=6.0.12.20260906",
+]
+
+[project.scripts]
+agent-eval = "agentplat.eval.cli:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "N", "ASYNC"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["sse_starlette.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "integration: needs Postgres/Redis (docker compose up -d postgres redis)",
+  "live: calls a real paid model API; never run in CI",
+]
+addopts = "-m 'not live'"
