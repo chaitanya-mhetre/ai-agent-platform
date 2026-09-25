@@ -56,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: {fetch-depth: 0}  # gitleaks scans the pushed commit range; a shallow clone lacks it
       - run: docker build -t agentplat:ci .
       - name: secret scan
         uses: gitleaks/gitleaks-action@v2
