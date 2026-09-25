@@ -22,6 +22,8 @@ from agentplat.messages import Message, ModelResponse, Role, ToolCall
 from agentplat.providers.base import ModelProvider
 from agentplat.runtime.events import EventPublisher
 from agentplat.runtime.executor import ToolExecutor
+from agentplat.security.redaction import Redactor, SecretStore
+from agentplat.security.taint import SECURITY_PREAMBLE, fence_untrusted, injection_signals
 from agentplat.state import RunStatus
 from agentplat.store.models import Agent, Approval, Run, ToolCallRecord
 from agentplat.store.sql import NotFoundError, SqlStore, new_id
@@ -72,6 +74,9 @@ class Runtime:
         lease_ttl_s: float = 30.0,
         guard: Guard | None = None,
         executor: ToolExecutor | None = None,
+        secrets: SecretStore | None = None,
+        redactor: Redactor | None = None,
+        max_observation_chars: int = 8000,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -81,6 +86,9 @@ class Runtime:
         self.lease_ttl_s = lease_ttl_s
         self.guard: Guard = guard or AllowListGuard()
         self.executor = executor or ToolExecutor()
+        self.secrets = secrets or SecretStore()
+        self.redactor = redactor or Redactor(self.secrets.all_values())
+        self.max_observation_chars = max_observation_chars
 
     # -- public API ----------------------------------------------------------------
 
@@ -93,7 +101,10 @@ class Runtime:
             user_id=user_id,
             status=RunStatus.QUEUED,
             input=user_input,
-            messages=[Message(Role.SYSTEM, agent.system_prompt), Message(Role.USER, user_input)],
+            messages=[
+                Message(Role.SYSTEM, agent.system_prompt + SECURITY_PREAMBLE),
+                Message(Role.USER, user_input),
+            ],
         )
         await self.store.create_run(run)
         await self.events.emit(run.id, "status", status=run.status.value)
@@ -242,7 +253,7 @@ class Runtime:
                 status="awaiting_approval",
             )
         )
-        await self.store.audit(
+        await self._audit(
             run.tenant_id,
             "agent",
             run.agent_id,
@@ -284,18 +295,31 @@ class Runtime:
             )
         rec.status, rec.decision, rec.decision_reason = "started", "allowed", decision.reason
         await self.store.upsert_tool_call(rec)  # "started" marker survives a crash
-        ctx = ToolContext(run.id, run.user_id, run.tenant_id, idempotency_key=key)
+        ctx = ToolContext(
+            run.id,
+            run.user_id,
+            run.tenant_id,
+            idempotency_key=key,
+            secrets=self.secrets.for_tool(call.name),  # only this tool's credentials
+        )
         assert decision.args is not None
         outcome = await self.executor.execute(tool, decision.args, ctx)
         rec.attempts += outcome.attempts
         rec.latency_ms = outcome.latency_ms
         if outcome.result is not None:
-            rec.status, rec.output = "succeeded", outcome.result.output
-            rec.output_tainted = outcome.result.tainted
+            error = self._validate_output(tool, outcome.result.output)
+            if error:
+                rec.status, rec.error = "failed", error
+            else:
+                rec.status, rec.output = "succeeded", outcome.result.output
+                if outcome.result.tainted:
+                    rec.output_tainted = True
+                    rec.output = {"source": outcome.result.source, "content": rec.output}
+                    await self._on_untrusted(run, call, outcome.result.output)
         else:
             rec.status, rec.error = "failed", outcome.error
         await self.store.upsert_tool_call(rec)
-        await self.store.audit(
+        await self._audit(
             run.tenant_id,
             "agent",
             run.agent_id,
@@ -318,7 +342,7 @@ class Runtime:
                 {
                     "note": "a human reviewer edited the arguments",
                     "executed_with": effective.arguments,
-                    "output": rec.output if rec.status == "succeeded" else {"error": rec.error},
+                    "output": obs,
                 }
             )
         return obs
@@ -339,7 +363,7 @@ class Runtime:
                 output={"details": details} if details else None,
             )
         )
-        await self.store.audit(
+        await self._audit(
             run.tenant_id,
             "agent",
             run.agent_id,
@@ -353,14 +377,63 @@ class Runtime:
             payload["details"] = details
         return observation(payload)
 
-    @staticmethod
-    def _observation_from(rec: ToolCallRecord) -> str:
+    def _observation_from(self, rec: ToolCallRecord) -> str:
         if rec.status == "succeeded":
-            return observation(rec.output)
+            if rec.output_tainted and isinstance(rec.output, dict):
+                text = observation(rec.output.get("content"))
+                text = fence_untrusted(self._cap(text), rec.output.get("source") or rec.tool_name)
+            else:
+                text = self._cap(observation(rec.output))
+            return self.redactor.text(text)
         payload: dict[str, Any] = {"error": rec.error or rec.decision_reason or "failed"}
         if isinstance(rec.output, dict) and rec.output.get("details"):
             payload["details"] = rec.output["details"]
-        return observation(payload)
+        return self.redactor.text(observation(payload))
+
+    def _cap(self, text: str) -> str:
+        if len(text) <= self.max_observation_chars:
+            return text
+        dropped = len(text) - self.max_observation_chars
+        return text[: self.max_observation_chars] + f"\n...[truncated {dropped} chars]"
+
+    @staticmethod
+    def _validate_output(tool: Tool[Any], output: Any) -> str | None:
+        if tool.output_model is None:
+            return None
+        try:
+            tool.output_model.model_validate(output)
+        except ValidationError as exc:
+            return f"tool returned invalid output ({exc.error_count()} errors)"
+        return None
+
+    async def _on_untrusted(self, run: Run, call: ToolCall, output: Any) -> None:
+        run.tainted = True
+        signals = injection_signals(observation(output))
+        if signals:
+            await self.events.emit(
+                run.id, "injection_suspected", tool=call.name, signals=signals[:5]
+            )
+            await self._audit(
+                run.tenant_id,
+                "system",
+                "taint-detector",
+                "injection.suspected",
+                call.name,
+                {"run_id": run.id, "signals": signals[:5]},
+            )
+
+    async def _audit(
+        self,
+        tenant_id: str,
+        actor: str,
+        actor_id: str,
+        action: str,
+        target: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        await self.store.audit(
+            tenant_id, actor, actor_id, action, target, self.redactor.deep(details or {})
+        )
 
     # -- status helpers ----------------------------------------------------------------
 

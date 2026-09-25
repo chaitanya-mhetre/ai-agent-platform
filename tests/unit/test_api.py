@@ -163,3 +163,17 @@ async def test_approval_flow_over_http(client: httpx.AsyncClient, container: Con
     audit = (await client.get("/v1/audit", headers=boss)).json()
     assert {"approval.approved", "tool.executed"} <= {e["action"] for e in audit}
     assert (await client.get("/v1/audit", headers=H)).status_code == 403
+
+
+async def test_run_creation_is_rate_limited(
+    client: httpx.AsyncClient, container: Container
+) -> None:
+    container.settings.rate_limit_per_minute = 2
+    agent_id = await make_agent(client)
+    codes = [
+        (
+            await client.post("/v1/runs", json={"agent_id": agent_id, "input": "hi"}, headers=H)
+        ).status_code
+        for _ in range(3)
+    ]
+    assert codes == [201, 201, 429]

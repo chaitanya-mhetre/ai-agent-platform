@@ -98,6 +98,16 @@ def create_app(container: Container | None = None) -> FastAPI:
 
     @app.post("/v1/runs", status_code=201)
     async def create_run(body: RunIn, c: ContainerDep, p: PrincipalDep) -> dict[str, Any]:
+        limit = c.settings.rate_limit_per_minute
+        for key, n in (
+            (f"user:{p.tenant_id}:{p.user_id}", limit),
+            (f"tenant:{p.tenant_id}", limit * 10),
+        ):
+            allowed, retry_after = await c.limiter.hit(key, n)
+            if not allowed:
+                raise HTTPException(
+                    429, "rate limit exceeded", headers={"Retry-After": str(retry_after)}
+                )
         try:
             agent = await c.store.get_agent(body.agent_id, p.tenant_id)
         except NotFoundError:

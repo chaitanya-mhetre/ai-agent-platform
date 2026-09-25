@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
 
+    data_dir: str = "fixtures"  # sample DB, uploaded files, search index, offline web pages
+    offline_web: bool = False  # serve http_get from fixtures/pages (*.test hosts) - eval/demo
+    tool_secrets: dict[str, dict[str, str]] = {}  # {"tool_name": {"API_KEY": "..."}}
     bootstrap_admins: list[str] = []  # ["tenant:user", ...] granted admin at startup
     rate_limit_per_minute: int = 60
     pricing_file: str = "config/models.yaml"

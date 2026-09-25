@@ -1,0 +1,3 @@
+Meeting notes, 12 Sept.
+- Ship the approvals API this sprint.
+- Evaluate tool-selection accuracy weekly.

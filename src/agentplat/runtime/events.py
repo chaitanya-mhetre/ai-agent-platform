@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from redis.asyncio import Redis
 
+from agentplat.security.redaction import Redactor
 from agentplat.store.sql import SqlStore
 
 Event = dict[str, Any]
@@ -74,10 +75,12 @@ class RedisBus:
 
 
 class EventPublisher:
-    def __init__(self, store: SqlStore, bus: EventBus) -> None:
+    def __init__(self, store: SqlStore, bus: EventBus, redactor: Redactor | None = None) -> None:
         self.store = store
         self.bus = bus
+        self.redactor = redactor or Redactor()
 
     async def emit(self, run_id: str, type_: str, **data: Any) -> None:
+        data = self.redactor.deep(data)
         seq = await self.store.append_event(run_id, type_, data)
         await self.bus.publish(run_id, {"seq": seq, "type": type_, "data": data})

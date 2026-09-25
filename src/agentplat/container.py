@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from redis.asyncio import Redis
 
@@ -14,21 +15,39 @@ from agentplat.providers.factory import build_provider
 from agentplat.runtime.events import EventBus, EventPublisher, InMemoryBus, RedisBus
 from agentplat.runtime.queue import InMemoryQueue, JobQueue, RedisQueue
 from agentplat.runtime.worker import Worker
+from agentplat.security.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
+from agentplat.security.redaction import Redactor, SecretStore
 from agentplat.store.models import Agent
 from agentplat.store.sql import SqlStore
 from agentplat.tools.builtin.actions import CalendarCreateEvent, DeleteRecords, SendNotification
 from agentplat.tools.builtin.calculator import Calculator
+from agentplat.tools.builtin.data import FileAnalyze, SqlQuery
 from agentplat.tools.builtin.notes import NotesRead, NotesWrite
+from agentplat.tools.builtin.web import HttpGet, WebSearch
+from agentplat.tools.fixture_web import fixture_resolver_for, fixture_transport
 from agentplat.tools.registry import ToolRegistry
 from agentplat.tools.services import Services
 
 
-def default_registry(store: SqlStore, services: Services) -> ToolRegistry:
+def default_registry(store: SqlStore, services: Services, settings: Settings) -> ToolRegistry:
+    data = Path(settings.data_dir)
+    http_get = (
+        HttpGet(
+            resolver=fixture_resolver_for(data / "pages"),
+            transport=fixture_transport(data / "pages"),
+        )
+        if settings.offline_web
+        else HttpGet()
+    )
     return ToolRegistry(
         [
             Calculator(),
             NotesWrite(store),
             NotesRead(store),
+            http_get,
+            WebSearch(data / "search" / "index.json"),
+            FileAnalyze(data / "files"),
+            SqlQuery(data / "sample.db"),
             SendNotification(services.outbox),
             CalendarCreateEvent(services.calendar),
             DeleteRecords(services.records),
@@ -45,6 +64,7 @@ class Container:
     registry: ToolRegistry
     runtime: Runtime
     services: Services
+    limiter: RateLimiter
     redis: Redis | None = None
     _providers: dict[tuple[str, str | None], ModelProvider] = field(default_factory=dict)
 
@@ -95,17 +115,25 @@ def build_container(
     else:
         bus, queue = InMemoryBus(), InMemoryQueue()
     services = Services()
-    registry = registry or default_registry(store, services)
+    registry = registry or default_registry(store, services, settings)
+    limiter: RateLimiter = RedisRateLimiter(redis) if redis else InMemoryRateLimiter()
+    secrets = SecretStore(settings.tool_secrets)
+    provider_keys = [
+        k for k in (settings.api_key_for(p) for p in ("openai", "anthropic", "gemini")) if k
+    ]
+    redactor = Redactor([*secrets.all_values(), *provider_keys])
     holder: dict[str, Container] = {}
     runtime = Runtime(
         store,
         registry,
         lambda agent: holder["c"].provider_for(agent),
-        EventPublisher(store, bus),
+        EventPublisher(store, bus, redactor),
         worker_id=worker_id,
         lease_ttl_s=settings.lease_ttl_s,
         guard=GuardPipeline(store.permissions, store.approval_for_call),
+        secrets=secrets,
+        redactor=redactor,
     )
-    c = Container(settings, store, bus, queue, registry, runtime, services, redis)
+    c = Container(settings, store, bus, queue, registry, runtime, services, limiter, redis)
     holder["c"] = c
     return c
