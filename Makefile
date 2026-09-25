@@ -9,7 +9,7 @@ type:
 fmt:
 	uv run ruff format . && uv run ruff check --fix .
 up:
-	docker compose up -d postgres redis
+	docker compose up -d --wait postgres redis
 down:
 	docker compose down
 integration: up
