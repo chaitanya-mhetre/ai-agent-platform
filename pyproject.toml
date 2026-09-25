@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.22.1",
+    "alembic>=1.16",
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
@@ -41,6 +42,7 @@ dev = [
 
 [project.scripts]
 agent-eval = "agentplat.eval.cli:app"
+agentplat-db = "agentplat.store.db_cli:app"
 
 [tool.ruff]
 line-length = 100
