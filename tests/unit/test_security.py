@@ -320,7 +320,7 @@ async def test_tool_gets_only_its_secret_and_it_is_redacted_everywhere(c: Contai
 def test_redactor_patterns() -> None:
     r = Redactor(["my-db-password"])
     text = (
-        "key=AIzaSyA1234567890abcdefghijklmnopqrstu pw=my-db-password "
+        "key=AIzaSyA1234567890abcdefghijklmnopqrstu pw=my-db-password "  # gitleaks:allow
         "auth: Bearer abcdefghijklmnopqrstuvwx"
     )
     out = r.text(text)
