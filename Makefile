@@ -1,4 +1,4 @@
-.PHONY: check test lint type fmt up down integration eval
+.PHONY: check test lint type fmt up down integration eval migrate migration
 check: lint type test
 test:
 	uv run pytest -q
@@ -17,3 +17,7 @@ integration: up
 	AGENTPLAT_TEST_REDIS_URL=redis://localhost:56381/0 uv run pytest -q -m integration
 eval:
 	uv run agent-eval run suites/core.yaml --out reports/
+migrate:
+	uv run agentplat-db upgrade
+migration:
+	uv run agentplat-db revision "$(m)"
