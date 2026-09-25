@@ -105,7 +105,9 @@ class EvalRunner:
         model: str | None = None,
         data_dir: str = "fixtures",
         base_settings: Settings | None = None,
+        ablate_taint_policy: bool = False,
     ) -> None:
+        self.ablate_taint_policy = ablate_taint_policy
         self.provider = provider
         self.model = model
         self.data_dir = data_dir
@@ -120,7 +122,8 @@ class EvalRunner:
             repeats=repeats,
             git_sha=_git_sha(),
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-            label=OFFLINE_LABEL if self.provider == "fake" else "measured",
+            label=(OFFLINE_LABEL if self.provider == "fake" else "measured")
+            + (" | ABLATION: taint policy disabled" if self.ablate_taint_policy else ""),
         )
         for item in suite.items:
             for r in range(repeats):
@@ -148,6 +151,14 @@ class EvalRunner:
 
     async def _run(self, c: Container, item: Item, repeat: int) -> ItemResult:
         await c.store.create_schema()
+        if self.ablate_taint_policy:
+            from agentplat.guards import GuardPipeline, PolicyConfig
+
+            c.runtime.guard = GuardPipeline(
+                c.store.permissions,
+                c.store.approval_for_call,
+                PolicyConfig(taint_escalates=frozenset()),
+            )
         if item.inject_failure:
             _inject(c, item.inject_failure)
         tools = item.agent_tools or [t.name for t in c.registry]
@@ -389,7 +400,8 @@ def render_markdown(report: Report) -> str:
 def save_report(report: Report, out_dir: str | Path) -> tuple[Path, Path]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stem = f"{report.suite}-{report.provider}-{report.git_sha}"
+    suffix = "-ablation-no-taint" if "ABLATION" in report.label else ""
+    stem = f"{report.suite}-{report.provider}-{report.git_sha}{suffix}"
     jp, mp = out / f"{stem}.json", out / f"{stem}.md"
     jp.write_text(report.to_json())
     mp.write_text(render_markdown(report))

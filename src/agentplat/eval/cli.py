@@ -24,9 +24,14 @@ def run(
     out: Annotated[Path, typer.Option(help="Report directory")] = Path("reports"),
     data_dir: Annotated[str, typer.Option(help="Fixtures directory")] = "fixtures",
     min_pass_rate: Annotated[float | None, typer.Option(help="Exit 1 if below (CI gate)")] = None,
+    ablate_taint_policy: Annotated[
+        bool, typer.Option(help="Control experiment: disable taint escalation")
+    ] = False,
 ) -> None:
     s = load_suite(suite)
-    runner = EvalRunner(provider=provider, model=model, data_dir=data_dir)
+    runner = EvalRunner(
+        provider=provider, model=model, data_dir=data_dir, ablate_taint_policy=ablate_taint_policy
+    )
     report = asyncio.run(runner.run_suite(s, repeats=repeat))
     jp, mp = save_report(report, out)
     m = report.metrics
