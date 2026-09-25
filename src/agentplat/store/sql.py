@@ -398,6 +398,15 @@ class SqlStore:
             )
         return res.rowcount == 1
 
+    async def pending_approvals_for_run(self, run_id: str) -> int:
+        q = (
+            sa.select(sa.func.count())
+            .select_from(t.approvals)
+            .where(t.approvals.c.run_id == run_id, t.approvals.c.decision == "pending")
+        )
+        async with self.engine.connect() as c:
+            return int((await c.execute(q)).scalar_one())
+
     async def count_pending_approvals(self) -> int:
         q = (
             sa.select(sa.func.count())

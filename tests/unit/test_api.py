@@ -127,3 +127,39 @@ async def test_cancel_terminal_run_conflicts(client: httpx.AsyncClient) -> None:
         )
     ).json()["id"]
     assert (await client.post(f"/v1/runs/{run_id}/cancel", headers=H)).status_code == 409
+
+
+async def test_approval_flow_over_http(client: httpx.AsyncClient, container: Container) -> None:
+    await container.store.grant("acme", "alice", ["notify:send"])
+    await container.store.grant("acme", "boss", ["approvals:decide", "admin"])
+    agent_id = await make_agent(client, allowed_tools=["send_notification"])
+    run = (
+        await client.post(
+            "/v1/runs",
+            json={
+                "agent_id": agent_id,
+                "input": "notify the team about the outage",
+                "mode": "sync",
+            },
+            headers=H,
+        )
+    ).json()
+    assert run["status"] == "awaiting_approval"
+
+    (pending,) = (await client.get("/v1/approvals", headers=H)).json()
+    boss = {"X-Tenant-Id": "acme", "X-User-Id": "boss"}
+    r = await client.post(f"/v1/approvals/{pending['id']}", json={"decision": "approve"}, headers=H)
+    assert r.status_code == 403
+    r = await client.post(
+        f"/v1/approvals/{pending['id']}", json={"decision": "approve"}, headers=boss
+    )
+    assert r.status_code == 200 and r.json()["decided_by"] == "boss"
+
+    await container.worker().process_one()
+    final = (await client.get(f"/v1/runs/{run['id']}", headers=H)).json()
+    assert final["status"] == "succeeded"
+    assert len(container.services.outbox.sent) == 1
+
+    audit = (await client.get("/v1/audit", headers=boss)).json()
+    assert {"approval.approved", "tool.executed"} <= {e["action"] for e in audit}
+    assert (await client.get("/v1/audit", headers=H)).status_code == 403

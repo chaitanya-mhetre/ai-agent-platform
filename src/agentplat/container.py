@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from redis.asyncio import Redis
 
 from agentplat.config import Settings
+from agentplat.guards import GuardPipeline
 from agentplat.orchestrator import Runtime
 from agentplat.providers.base import ModelProvider
 from agentplat.providers.factory import build_provider
@@ -15,13 +16,24 @@ from agentplat.runtime.queue import InMemoryQueue, JobQueue, RedisQueue
 from agentplat.runtime.worker import Worker
 from agentplat.store.models import Agent
 from agentplat.store.sql import SqlStore
+from agentplat.tools.builtin.actions import CalendarCreateEvent, DeleteRecords, SendNotification
 from agentplat.tools.builtin.calculator import Calculator
 from agentplat.tools.builtin.notes import NotesRead, NotesWrite
 from agentplat.tools.registry import ToolRegistry
+from agentplat.tools.services import Services
 
 
-def default_registry(store: SqlStore) -> ToolRegistry:
-    return ToolRegistry([Calculator(), NotesWrite(store), NotesRead(store)])
+def default_registry(store: SqlStore, services: Services) -> ToolRegistry:
+    return ToolRegistry(
+        [
+            Calculator(),
+            NotesWrite(store),
+            NotesRead(store),
+            SendNotification(services.outbox),
+            CalendarCreateEvent(services.calendar),
+            DeleteRecords(services.records),
+        ]
+    )
 
 
 @dataclass
@@ -32,6 +44,7 @@ class Container:
     queue: JobQueue
     registry: ToolRegistry
     runtime: Runtime
+    services: Services
     redis: Redis | None = None
     _providers: dict[tuple[str, str | None], ModelProvider] = field(default_factory=dict)
 
@@ -47,6 +60,13 @@ class Container:
                 base_url=self.settings.openai_base_url,
             )
         return self._providers[key]
+
+    async def bootstrap(self) -> None:
+        """Dev convenience: grant `admin` to tenant:user pairs from settings."""
+        for entry in self.settings.bootstrap_admins:
+            tenant, _, user = entry.partition(":")
+            if tenant and user:
+                await self.store.grant(tenant, user, ["admin", "approvals:decide"])
 
     def worker(self) -> Worker:
         return Worker(self.runtime, self.queue, concurrency=self.settings.worker_concurrency)
@@ -74,7 +94,8 @@ def build_container(
         bus, queue = RedisBus(redis), RedisQueue(redis)
     else:
         bus, queue = InMemoryBus(), InMemoryQueue()
-    registry = registry or default_registry(store)
+    services = Services()
+    registry = registry or default_registry(store, services)
     holder: dict[str, Container] = {}
     runtime = Runtime(
         store,
@@ -83,7 +104,8 @@ def build_container(
         EventPublisher(store, bus),
         worker_id=worker_id,
         lease_ttl_s=settings.lease_ttl_s,
+        guard=GuardPipeline(store.permissions, store.approval_for_call),
     )
-    c = Container(settings, store, bus, queue, registry, runtime, redis)
+    c = Container(settings, store, bus, queue, registry, runtime, services, redis)
     holder["c"] = c
     return c

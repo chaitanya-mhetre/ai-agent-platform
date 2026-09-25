@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
 
+    bootstrap_admins: list[str] = []  # ["tenant:user", ...] granted admin at startup
     rate_limit_per_minute: int = 60
     pricing_file: str = "config/models.yaml"
 

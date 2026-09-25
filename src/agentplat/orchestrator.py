@@ -23,7 +23,7 @@ from agentplat.providers.base import ModelProvider
 from agentplat.runtime.events import EventPublisher
 from agentplat.runtime.executor import ToolExecutor
 from agentplat.state import RunStatus
-from agentplat.store.models import Agent, Run, ToolCallRecord
+from agentplat.store.models import Agent, Approval, Run, ToolCallRecord
 from agentplat.store.sql import NotFoundError, SqlStore, new_id
 from agentplat.tools.base import Tool, ToolContext
 from agentplat.tools.registry import ToolRegistry, UnknownToolError
@@ -188,7 +188,6 @@ class Runtime:
             await self.store.save_progress(run)
 
     async def _handle_call(self, run: Run, agent: Agent, call: ToolCall) -> str:
-        key = idempotency_key(run.id, call)
         rec = await self.store.get_tool_call(run.id, call.id)
         if rec is not None and rec.status in {"succeeded", "failed", "denied"}:
             # Executed before a crash, but the observation was never persisted.
@@ -197,22 +196,68 @@ class Runtime:
         try:
             tool = self.registry.get(call.name)
         except UnknownToolError:
-            return await self._deny(run, call, key, f"unknown tool {call.name!r}")
+            return await self._deny(run, call, f"unknown tool {call.name!r}")
         try:
             decision = await self.guard.decide(run, agent, call, tool)
         except ValidationError as exc:
             return await self._deny(
                 run,
                 call,
-                key,
                 "invalid arguments",
                 details=exc.errors(include_url=False, include_context=False),
             )
         if decision.verdict is Verdict.DENY:
-            return await self._deny(run, call, key, decision.reason)
+            return await self._deny(run, call, decision.reason)
         if decision.verdict is Verdict.APPROVAL:
-            raise Paused  # handled in M4
-        return await self._run_tool(run, call, tool, decision, key, rec)
+            await self._request_approval(run, call, tool, decision)
+            raise Paused
+        return await self._run_tool(run, call, tool, decision, rec)
+
+    async def _request_approval(
+        self, run: Run, call: ToolCall, tool: Tool[Any], decision: Decision
+    ) -> None:
+        if decision.approval is not None:
+            return  # already requested; still pending
+        approval = await self.store.create_approval(
+            Approval(
+                id=new_id(),
+                tenant_id=run.tenant_id,
+                run_id=run.id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                args=call.arguments,
+                reason=decision.reason,
+            )
+        )
+        await self.store.upsert_tool_call(
+            ToolCallRecord(
+                id=call.id,
+                run_id=run.id,
+                step=run.step_count,
+                tool_name=call.name,
+                args=call.arguments,
+                idempotency_key=idempotency_key(run.id, call),
+                decision=Verdict.APPROVAL.value,
+                decision_reason=decision.reason,
+                status="awaiting_approval",
+            )
+        )
+        await self.store.audit(
+            run.tenant_id,
+            "agent",
+            run.agent_id,
+            "tool.approval_requested",
+            call.name,
+            {"run_id": run.id, "approval_id": approval.id, "reason": decision.reason},
+        )
+        await self.events.emit(
+            run.id,
+            "awaiting_approval",
+            approval_id=approval.id,
+            tool=call.name,
+            args=call.arguments,
+            reason=decision.reason,
+        )
 
     async def _run_tool(
         self,
@@ -220,23 +265,27 @@ class Runtime:
         call: ToolCall,
         tool: Tool[Any],
         decision: Decision,
-        key: str,
         rec: ToolCallRecord | None,
     ) -> str:
-        rec = rec or ToolCallRecord(
-            id=call.id,
-            run_id=run.id,
-            step=run.step_count,
-            tool_name=call.name,
-            args=call.arguments,
-            idempotency_key=key,
-            decision=decision.verdict.value,
-            decision_reason=decision.reason,
-            status="started",
-        )
-        rec.status = "started"
+        effective = replace(call, arguments=decision.arguments or call.arguments)
+        key = idempotency_key(run.id, effective)
+        if rec is None or rec.idempotency_key != key:
+            rec = ToolCallRecord(
+                id=call.id,
+                run_id=run.id,
+                step=run.step_count,
+                tool_name=call.name,
+                args=effective.arguments,
+                idempotency_key=key,
+                decision=decision.verdict.value,
+                decision_reason=decision.reason,
+                status="started",
+                attempts=rec.attempts if rec else 0,
+            )
+        rec.status, rec.decision, rec.decision_reason = "started", "allowed", decision.reason
         await self.store.upsert_tool_call(rec)  # "started" marker survives a crash
         ctx = ToolContext(run.id, run.user_id, run.tenant_id, idempotency_key=key)
+        assert decision.args is not None
         outcome = await self.executor.execute(tool, decision.args, ctx)
         rec.attempts += outcome.attempts
         rec.latency_ms = outcome.latency_ms
@@ -246,14 +295,35 @@ class Runtime:
         else:
             rec.status, rec.error = "failed", outcome.error
         await self.store.upsert_tool_call(rec)
+        await self.store.audit(
+            run.tenant_id,
+            "agent",
+            run.agent_id,
+            "tool.executed" if outcome.ok else "tool.failed",
+            call.name,
+            {
+                "run_id": run.id,
+                "args": effective.arguments,
+                "reason": decision.reason,
+                "attempts": outcome.attempts,
+                "error": outcome.error,
+            },
+        )
         await self.events.emit(
             run.id, "tool_result", tool=call.name, ok=outcome.ok, error=outcome.error
         )
-        return self._observation_from(rec)
+        obs = self._observation_from(rec)
+        if effective.arguments != call.arguments:
+            obs = observation(
+                {
+                    "note": "a human reviewer edited the arguments",
+                    "executed_with": effective.arguments,
+                    "output": rec.output if rec.status == "succeeded" else {"error": rec.error},
+                }
+            )
+        return obs
 
-    async def _deny(
-        self, run: Run, call: ToolCall, key: str, reason: str, *, details: Any = None
-    ) -> str:
+    async def _deny(self, run: Run, call: ToolCall, reason: str, *, details: Any = None) -> str:
         await self.store.upsert_tool_call(
             ToolCallRecord(
                 id=call.id,
@@ -261,13 +331,21 @@ class Runtime:
                 step=run.step_count,
                 tool_name=call.name,
                 args=call.arguments,
-                idempotency_key=key,
+                idempotency_key=idempotency_key(run.id, call),
                 decision=Verdict.DENY.value,
                 decision_reason=reason,
                 status="denied",
                 error=reason,
                 output={"details": details} if details else None,
             )
+        )
+        await self.store.audit(
+            run.tenant_id,
+            "agent",
+            run.agent_id,
+            "tool.denied",
+            call.name,
+            {"run_id": run.id, "args": call.arguments, "reason": reason},
         )
         await self.events.emit(run.id, "tool_call_denied", tool=call.name, reason=reason)
         payload: dict[str, Any] = {"error": reason}

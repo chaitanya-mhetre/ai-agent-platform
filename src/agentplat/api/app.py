@@ -13,7 +13,8 @@ from sse_starlette.sse import EventSourceResponse
 
 from agentplat import __version__
 from agentplat.api.deps import ContainerDep, PrincipalDep
-from agentplat.api.schemas import AgentIn, RunIn
+from agentplat.api.schemas import AgentIn, ApprovalDecisionIn, PermissionsIn, RunIn
+from agentplat.approvals import ApprovalError, decide
 from agentplat.container import Container, build_container
 from agentplat.state import RunStatus
 from agentplat.store.models import Agent, Run
@@ -29,6 +30,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         app.state.container = c
         if c.settings.auto_create_schema:
             await c.store.create_schema()
+        await c.bootstrap()
         stop = asyncio.Event()
         worker_task = None
         if c.settings.embedded_worker:
@@ -151,6 +153,67 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def run_events(run_id: str, c: ContainerDep, p: PrincipalDep) -> EventSourceResponse:
         await load_run(c, run_id, p.tenant_id)
         return EventSourceResponse(stream_events(c, run_id))
+
+    # -- approvals -----------------------------------------------------------------
+
+    @app.get("/v1/approvals")
+    async def list_approvals(
+        c: ContainerDep, p: PrincipalDep, status: str | None = "pending"
+    ) -> list[dict[str, Any]]:
+        return [a.to_dict() for a in await c.store.list_approvals(p.tenant_id, status)]
+
+    @app.post("/v1/approvals/{approval_id}")
+    async def decide_approval(
+        approval_id: str, body: ApprovalDecisionIn, c: ContainerDep, p: PrincipalDep
+    ) -> dict[str, Any]:
+        try:
+            approval = await decide(
+                c,
+                tenant_id=p.tenant_id,
+                user_id=p.user_id,
+                approval_id=approval_id,
+                decision=body.decision,
+                edited_args=body.edited_args,
+                comment=body.comment,
+            )
+        except NotFoundError:
+            raise HTTPException(404, "approval not found") from None
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
+        return approval.to_dict()
+
+    # -- permissions & audit (admin) ---------------------------------------------------
+
+    async def require_admin(c: Container, tenant_id: str, user_id: str) -> None:
+        if "admin" not in await c.store.permissions(tenant_id, user_id):
+            raise HTTPException(403, "admin only")
+
+    @app.get("/v1/users/{user_id}/permissions")
+    async def get_permissions(user_id: str, c: ContainerDep, p: PrincipalDep) -> list[str]:
+        if user_id != p.user_id:
+            await require_admin(c, p.tenant_id, p.user_id)
+        return sorted(await c.store.permissions(p.tenant_id, user_id))
+
+    @app.post("/v1/users/{user_id}/permissions", status_code=201)
+    async def grant_permissions(
+        user_id: str, body: PermissionsIn, c: ContainerDep, p: PrincipalDep
+    ) -> list[str]:
+        await require_admin(c, p.tenant_id, p.user_id)
+        await c.store.grant(p.tenant_id, user_id, body.permissions)
+        await c.store.audit(
+            p.tenant_id,
+            "user",
+            p.user_id,
+            "permissions.grant",
+            user_id,
+            {"granted": body.permissions},
+        )
+        return sorted(await c.store.permissions(p.tenant_id, user_id))
+
+    @app.get("/v1/audit")
+    async def audit(c: ContainerDep, p: PrincipalDep) -> list[dict[str, Any]]:
+        await require_admin(c, p.tenant_id, p.user_id)
+        return await c.store.list_audit(p.tenant_id)
 
     return app
 
