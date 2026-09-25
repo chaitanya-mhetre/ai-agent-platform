@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+### Changed
+- Schema is managed by Alembic (revision `0001`) instead of `metadata.create_all`. API and worker run
+  `upgrade head` on startup under a Postgres advisory lock; `AGENTPLAT_AUTO_CREATE_SCHEMA` is renamed to
+  `AGENTPLAT_AUTO_MIGRATE`. Databases created by the old `create_all` are stamped at `0001`. (#1)
+### Added
+- `agentplat-db` CLI (`upgrade`, `downgrade`, `current`, `revision`) and `make migrate` / `make migration`. (#1)
+- Migration tests (round trip, idempotency, drift, legacy adoption, concurrent migrators) and a CI round trip
+  on real Postgres. (#1)
+
 ## [0.1.0] - 2026-09-25
 ### Added
 - M1: provider-neutral messages, tool registry, agent loop, scripted fake provider.

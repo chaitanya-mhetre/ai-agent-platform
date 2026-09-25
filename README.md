@@ -120,7 +120,8 @@ Real-model results (tool-selection accuracy, residual injection rate, cost per r
 
 ## Testing
 - Unit tests (124): the loop, state machine, leases, crash recovery, guards and approvals, the SSRF corpus, the SQL write-refusal corpus, taint and ablation, redaction, cost and trace trees, the API (including SSE and tenant isolation), and the evaluation harness.
-- Integration tests (4, `make integration`): the full run on Postgres with Redis events, status compare-and-set and lease exclusivity under contention, and the Redis queue.
+- Integration tests (5, `make integration`): the full run on Postgres with Redis events, status compare-and-set and lease exclusivity under contention, the Redis queue, and concurrent migrations serialized by the advisory lock.
+- Migration tests: empty → head → base → head, idempotent re-run, model/migration drift check, and adoption of pre-Alembic databases. CI also runs `agentplat-db upgrade/downgrade base/upgrade` against real Postgres.
 - CI: lint/types/tests, integration with service containers, eval smoke gate (`--min-pass-rate 1.0`), Docker build, gitleaks.
 
 ## Deployment
@@ -140,18 +141,26 @@ Read [`docs/threat-model.md`](docs/threat-model.md). It maps each threat to the 
 - **Persist before execute:** one extra write per step, in exchange for crash-safe resume without re-asking the model.
 - **Coarse taint (per run):** simple and measurable, but it can cause approval fatigue. Per-value taint is future work.
 - **SQLAlchemy Core, not the ORM:** explicit SQL for compare-and-set updates, and a single codebase for SQLite (tests) and Postgres (prod).
+- **Alembic, run at startup under a Postgres advisory lock:** simple for a single-service deploy and safe when API and worker boot together. Larger deploys should run `agentplat-db upgrade` as a separate release step and set `AGENTPLAT_AUTO_MIGRATE=false`.
 - **Fixed-window rate limit:** simple, but it lets bursts through at window edges. A token bucket is future work.
+
+## Schema changes
+```bash
+make migrate                      # upgrade to head (also runs on startup unless AGENTPLAT_AUTO_MIGRATE=false)
+make migration m="add foo column"  # autogenerate a revision from store/schema.py, then review it by hand
+uv run agentplat-db downgrade base # roll back
+```
+`tests/unit/test_migrations.py` fails if `store/schema.py` changes without a matching revision.
 
 ## Limitations
 - Dev identity headers. Production needs JWT verification (or a gateway that does it).
-- The schema is created with `create_all`. **Alembic migrations are not added yet.**
 - Prompt injection is mitigated, not solved: exfiltration through read-only `http_get` after taint is possible (see the threat model).
 - The LangGraph hands-on comparison is not done. Real-model eval numbers are not measured.
 - The fake downstream services (outbox, calendar, records) are in-memory.
 
 ## Roadmap
 - [x] M1 loop · M2 providers · M3 durability/API · M4 guards/approvals · M5 security · M6 observability · M7 evaluation
-- [~] M8: Docker, CI and docs done. **TODO:** LangGraph re-implementation and comparison, Alembic migrations, real-model eval report.
+- [~] M8: Docker, CI and docs done. Alembic migrations done (#1). **TODO:** LangGraph re-implementation and comparison, real-model eval report.
 - Later: per-value taint, egress allow-list per agent, `rag-engine` as a `knowledge_search` tool, `ai-gateway` as the provider.
 
 ## Contributing
