@@ -1,0 +1,49 @@
+# Local stack. `make up` starts only postgres + redis (for tests / running the API on the host);
+# `docker compose up` starts everything.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports: ["55434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent"]
+      interval: 2s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["56381:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 20
+
+  api:
+    build: .
+    command: ["uvicorn", "agentplat.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: &env
+      AGENTPLAT_DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      AGENTPLAT_REDIS_URL: redis://redis:6379/0
+      AGENTPLAT_EMBEDDED_WORKER: "false"
+      AGENTPLAT_PROVIDER: ${AGENTPLAT_PROVIDER:-fake}
+      AGENTPLAT_MODEL: ${AGENTPLAT_MODEL:-}
+      AGENTPLAT_GEMINI_API_KEY: ${AGENTPLAT_GEMINI_API_KEY:-}
+      AGENTPLAT_OPENAI_API_KEY: ${AGENTPLAT_OPENAI_API_KEY:-}
+      AGENTPLAT_ANTHROPIC_API_KEY: ${AGENTPLAT_ANTHROPIC_API_KEY:-}
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  worker:
+    build: .
+    command: ["python", "-m", "agentplat.worker_main"]
+    environment: *env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    deploy:
+      replicas: 2

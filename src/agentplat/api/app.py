@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+
+import sqlalchemy as sa
+from fastapi import FastAPI, HTTPException
+from sse_starlette.sse import EventSourceResponse
+
+from agentplat import __version__
+from agentplat.api.deps import ContainerDep, PrincipalDep
+from agentplat.api.schemas import AgentIn, RunIn
+from agentplat.container import Container, build_container
+from agentplat.state import RunStatus
+from agentplat.store.models import Agent, Run
+from agentplat.store.sql import NotFoundError, new_id
+
+TERMINAL = {s.value for s in RunStatus if s.is_terminal}
+
+
+def create_app(container: Container | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        c = container or build_container()
+        app.state.container = c
+        if c.settings.auto_create_schema:
+            await c.store.create_schema()
+        stop = asyncio.Event()
+        worker_task = None
+        if c.settings.embedded_worker:
+            worker_task = asyncio.create_task(c.worker().run_forever(stop))
+        yield
+        stop.set()
+        if worker_task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+        if container is None:
+            await c.close()
+
+    app = FastAPI(title="agentplat", version=__version__, lifespan=lifespan)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready(c: ContainerDep) -> dict[str, str]:
+        async with c.store.engine.connect() as conn:
+            await conn.execute(sa.text("SELECT 1"))
+        return {"status": "ready"}
+
+    # -- agents & tools ----------------------------------------------------------
+
+    @app.post("/v1/agents", status_code=201)
+    async def create_agent(body: AgentIn, c: ContainerDep, p: PrincipalDep) -> dict[str, Any]:
+        unknown = [t for t in body.allowed_tools if t not in c.registry]
+        if unknown:
+            raise HTTPException(422, f"unknown tools: {unknown}")
+        agent = Agent(
+            id=new_id(),
+            tenant_id=p.tenant_id,
+            name=body.name,
+            system_prompt=body.system_prompt,
+            allowed_tools=body.allowed_tools,
+            model_config=body.model_config_,
+            max_steps=body.max_steps,
+            max_cost_usd=body.max_cost_usd,
+            max_tokens=body.max_tokens,
+        )
+        await c.store.create_agent(agent)
+        await c.store.audit(p.tenant_id, "user", p.user_id, "agent.create", agent.id)
+        return {"id": agent.id, "name": agent.name, "allowed_tools": agent.allowed_tools}
+
+    @app.get("/v1/agents")
+    async def list_agents(c: ContainerDep, p: PrincipalDep) -> list[dict[str, Any]]:
+        return [
+            {"id": a.id, "name": a.name, "allowed_tools": a.allowed_tools}
+            for a in await c.store.list_agents(p.tenant_id)
+        ]
+
+    @app.get("/v1/tools")
+    async def list_tools(c: ContainerDep) -> list[dict[str, Any]]:
+        return [t.describe() for t in c.registry]
+
+    # -- runs ----------------------------------------------------------------------
+
+    async def load_run(c: Container, run_id: str, tenant_id: str) -> Run:
+        try:
+            return await c.store.get_run(run_id, tenant_id)
+        except NotFoundError:
+            raise HTTPException(404, "run not found") from None
+
+    @app.post("/v1/runs", status_code=201)
+    async def create_run(body: RunIn, c: ContainerDep, p: PrincipalDep) -> dict[str, Any]:
+        try:
+            agent = await c.store.get_agent(body.agent_id, p.tenant_id)
+        except NotFoundError:
+            raise HTTPException(404, "agent not found") from None
+        run = await c.runtime.start_run(agent, p.user_id, body.input)
+        await c.store.audit(p.tenant_id, "user", p.user_id, "run.create", run.id)
+        if body.mode == "sync":
+            run = await c.runtime.execute(run.id)
+        else:
+            await c.queue.enqueue(run.id)
+        return run.summary()
+
+    @app.get("/v1/runs")
+    async def list_runs(c: ContainerDep, p: PrincipalDep) -> list[dict[str, Any]]:
+        return await c.store.list_runs(p.tenant_id)
+
+    @app.get("/v1/runs/{run_id}")
+    async def get_run(run_id: str, c: ContainerDep, p: PrincipalDep) -> dict[str, Any]:
+        run = await load_run(c, run_id, p.tenant_id)
+        out = run.summary()
+        out["messages"] = [m.to_dict() for m in run.messages]
+        out["tool_calls"] = [
+            {
+                "id": r.id,
+                "tool": r.tool_name,
+                "args": r.args,
+                "decision": r.decision,
+                "decision_reason": r.decision_reason,
+                "status": r.status,
+                "attempts": r.attempts,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+            }
+            for r in await c.store.list_tool_calls(run_id)
+        ]
+        return out
+
+    @app.post("/v1/runs/{run_id}/cancel", status_code=202)
+    async def cancel_run(run_id: str, c: ContainerDep, p: PrincipalDep) -> dict[str, str]:
+        run = await load_run(c, run_id, p.tenant_id)
+        if run.status.is_terminal:
+            raise HTTPException(409, f"run already {run.status.value}")
+        if run.status is RunStatus.AWAITING_APPROVAL and await c.store.transition(
+            run_id, RunStatus.AWAITING_APPROVAL, RunStatus.CANCELLED
+        ):
+            await c.runtime.events.emit(run_id, "status", status="cancelled")
+            return {"status": "cancelled"}
+        await c.store.request_cancel(run_id)
+        await c.store.audit(p.tenant_id, "user", p.user_id, "run.cancel", run_id)
+        return {"status": "cancel_requested"}
+
+    @app.get("/v1/runs/{run_id}/events")
+    async def run_events(run_id: str, c: ContainerDep, p: PrincipalDep) -> EventSourceResponse:
+        await load_run(c, run_id, p.tenant_id)
+        return EventSourceResponse(stream_events(c, run_id))
+
+    return app
+
+
+async def stream_events(
+    c: Container, run_id: str, *, idle_timeout_s: float = 300.0
+) -> AsyncIterator[dict[str, str]]:
+    """Replay persisted events, then tail live ones.
+
+    Subscribe *before* replaying so nothing published in between is lost; the
+    sequence number de-duplicates events seen in both.
+    """
+    async with c.bus.subscribe(run_id) as live:
+        last_seq = 0
+        for ev in await c.store.list_events(run_id):
+            last_seq = ev["seq"]
+            yield _sse(ev)
+            if _is_terminal(ev):
+                return
+        run = await c.store.get_run(run_id)
+        if run.status.is_terminal:
+            return
+        while True:
+            try:
+                async with asyncio.timeout(idle_timeout_s):
+                    ev = await anext(live)
+            except TimeoutError:
+                return
+            if ev["seq"] <= last_seq:
+                continue
+            last_seq = ev["seq"]
+            yield _sse(ev)
+            if _is_terminal(ev):
+                return
+
+
+def _is_terminal(ev: dict[str, Any]) -> bool:
+    return ev["type"] == "status" and ev["data"].get("status") in TERMINAL
+
+
+def _sse(ev: dict[str, Any]) -> dict[str, str]:
+    return {"id": str(ev["seq"]), "event": ev["type"], "data": json.dumps(ev["data"], default=str)}
+
+
+app = create_app()
