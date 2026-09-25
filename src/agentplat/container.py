@@ -9,6 +9,8 @@ from redis.asyncio import Redis
 
 from agentplat.config import Settings
 from agentplat.guards import GuardPipeline
+from agentplat.observability.pricing import PriceTable
+from agentplat.observability.tracing import Tracer, configure_otel
 from agentplat.orchestrator import Runtime
 from agentplat.providers.base import ModelProvider
 from agentplat.providers.factory import build_provider
@@ -122,6 +124,7 @@ def build_container(
         k for k in (settings.api_key_for(p) for p in ("openai", "anthropic", "gemini")) if k
     ]
     redactor = Redactor([*secrets.all_values(), *provider_keys])
+    configure_otel(settings.otel_endpoint)
     holder: dict[str, Container] = {}
     runtime = Runtime(
         store,
@@ -133,6 +136,8 @@ def build_container(
         guard=GuardPipeline(store.permissions, store.approval_for_call),
         secrets=secrets,
         redactor=redactor,
+        tracer=Tracer(store, redactor),
+        prices=PriceTable.load(settings.pricing_file),
     )
     c = Container(settings, store, bus, queue, registry, runtime, services, limiter, redis)
     holder["c"] = c

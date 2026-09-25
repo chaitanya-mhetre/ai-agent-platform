@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     bootstrap_admins: list[str] = []  # ["tenant:user", ...] granted admin at startup
     rate_limit_per_minute: int = 60
     pricing_file: str = "config/models.yaml"
+    otel_endpoint: str | None = None  # e.g. http://otel-collector:4318/v1/traces
+    worker_metrics_port: int = 9100
 
     def api_key_for(self, provider: str) -> str | None:
         secret = {

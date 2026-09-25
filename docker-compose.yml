@@ -33,6 +33,7 @@ services:
       AGENTPLAT_GEMINI_API_KEY: ${AGENTPLAT_GEMINI_API_KEY:-}
       AGENTPLAT_OPENAI_API_KEY: ${AGENTPLAT_OPENAI_API_KEY:-}
       AGENTPLAT_ANTHROPIC_API_KEY: ${AGENTPLAT_ANTHROPIC_API_KEY:-}
+      AGENTPLAT_OTEL_ENDPOINT: ${AGENTPLAT_OTEL_ENDPOINT:-}
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -47,3 +48,22 @@ services:
       redis: {condition: service_healthy}
     deploy:
       replicas: 2
+
+  # --- observability (docker compose --profile observability up) ---
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: [observability]
+    environment: {COLLECTOR_OTLP_ENABLED: "true"}
+    ports: ["16686:16686", "4318:4318"]
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    profiles: [observability]
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: [observability]
+    environment: {GF_AUTH_ANONYMOUS_ENABLED: "true", GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"}
+    ports: ["3000:3000"]

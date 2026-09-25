@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import sqlalchemy as sa
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sse_starlette.sse import EventSourceResponse
 
 from agentplat import __version__
@@ -16,6 +17,8 @@ from agentplat.api.deps import ContainerDep, PrincipalDep
 from agentplat.api.schemas import AgentIn, ApprovalDecisionIn, PermissionsIn, RunIn
 from agentplat.approvals import ApprovalError, decide
 from agentplat.container import Container, build_container
+from agentplat.observability import metrics
+from agentplat.observability.tracing import build_trace_tree
 from agentplat.state import RunStatus
 from agentplat.store.models import Agent, Run
 from agentplat.store.sql import NotFoundError, new_id
@@ -54,6 +57,11 @@ def create_app(container: Container | None = None) -> FastAPI:
         async with c.store.engine.connect() as conn:
             await conn.execute(sa.text("SELECT 1"))
         return {"status": "ready"}
+
+    @app.get("/metrics")
+    async def prometheus_metrics(c: ContainerDep) -> Response:
+        metrics.APPROVALS_PENDING.set(await c.store.count_pending_approvals())
+        return Response(generate_latest(metrics.REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     # -- agents & tools ----------------------------------------------------------
 
@@ -158,6 +166,27 @@ def create_app(container: Container | None = None) -> FastAPI:
         await c.store.request_cancel(run_id)
         await c.store.audit(p.tenant_id, "user", p.user_id, "run.cancel", run_id)
         return {"status": "cancel_requested"}
+
+    @app.get("/v1/runs/{run_id}/trace")
+    async def run_trace(run_id: str, c: ContainerDep, p: PrincipalDep) -> dict[str, Any]:
+        run = await load_run(c, run_id, p.tenant_id)
+        spans = await c.store.list_spans(run_id)
+        model_spans = [s for s in spans if s["kind"] == "model_call"]
+        tool_spans = [s for s in spans if s["kind"] == "tool_call"]
+        return {
+            "run_id": run_id,
+            "status": run.status.value,
+            "totals": {
+                "model_calls": len(model_spans),
+                "tool_calls": len(tool_spans),
+                "prompt_tokens": run.prompt_tokens,
+                "completion_tokens": run.completion_tokens,
+                "est_cost_usd": round(run.est_cost_usd, 6),
+                "model_time_ms": round(sum(s["duration_ms"] or 0 for s in model_spans), 3),
+                "tool_time_ms": round(sum(s["duration_ms"] or 0 for s in tool_spans), 3),
+            },
+            "spans": build_trace_tree(spans),
+        }
 
     @app.get("/v1/runs/{run_id}/events")
     async def run_events(run_id: str, c: ContainerDep, p: PrincipalDep) -> EventSourceResponse:

@@ -8,14 +8,18 @@ import os
 import signal
 import socket
 
+from prometheus_client import start_http_server
+
 from agentplat.config import Settings
 from agentplat.container import build_container
+from agentplat.observability.metrics import REGISTRY
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
     c = build_container(settings, worker_id=f"{socket.gethostname()}-{os.getpid()}")
+    start_http_server(settings.worker_metrics_port, registry=REGISTRY)
     if settings.auto_create_schema:
         await c.store.create_schema()
     stop = asyncio.Event()

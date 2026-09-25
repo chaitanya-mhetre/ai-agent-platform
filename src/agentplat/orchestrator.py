@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Protocol
@@ -19,6 +20,9 @@ from pydantic import ValidationError
 
 from agentplat.guards import AllowListGuard, Decision, Verdict
 from agentplat.messages import Message, ModelResponse, Role, ToolCall
+from agentplat.observability import metrics as m
+from agentplat.observability.pricing import PriceTable
+from agentplat.observability.tracing import Span, Tracer
 from agentplat.providers.base import ModelProvider
 from agentplat.runtime.events import EventPublisher
 from agentplat.runtime.executor import ToolExecutor
@@ -77,6 +81,8 @@ class Runtime:
         secrets: SecretStore | None = None,
         redactor: Redactor | None = None,
         max_observation_chars: int = 8000,
+        tracer: Tracer | None = None,
+        prices: PriceTable | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -89,6 +95,8 @@ class Runtime:
         self.secrets = secrets or SecretStore()
         self.redactor = redactor or Redactor(self.secrets.all_values())
         self.max_observation_chars = max_observation_chars
+        self.tracer = tracer or Tracer(store, self.redactor)
+        self.prices = prices or PriceTable({})
 
     # -- public API ----------------------------------------------------------------
 
@@ -118,7 +126,11 @@ class Runtime:
         if not await self.store.acquire_lease(run_id, self.worker_id, self.lease_ttl_s):
             return await self.store.get_run(run_id)
         try:
-            run = await self._drive(run_id)
+            async with self.tracer.span(
+                run_id, "run", "run.execute", worker=self.worker_id
+            ) as root:
+                run = await self._drive(run_id, root)
+                root.set(status=run.status.value, steps=run.step_count)
         except Exception as exc:  # BaseException (a real crash, cancellation) escapes
             run = await self._fail(run_id, exc)
         await self.store.release_lease(run_id, self.worker_id)
@@ -126,7 +138,7 @@ class Runtime:
 
     # -- the loop ------------------------------------------------------------------
 
-    async def _drive(self, run_id: str) -> Run:
+    async def _drive(self, run_id: str, root: Span) -> Run:
         run = await self.store.get_run(run_id)
         if run.status.is_terminal or run.status is RunStatus.AWAITING_APPROVAL:
             return run
@@ -143,7 +155,7 @@ class Runtime:
             pending = unanswered_calls(run.messages)
             if pending:
                 try:
-                    await self._process_calls(run, agent, pending)
+                    await self._process_calls(run, agent, pending, root)
                 except Paused:
                     await self._set_status(run, RunStatus.AWAITING_APPROVAL)
                     return run
@@ -154,7 +166,7 @@ class Runtime:
                 return await self._finish(run, stop)
 
             await self.events.emit(run.id, "step_started", step=run.step_count + 1)
-            response = await self._call_model(run, agent, provider)
+            response = await self._call_model(run, agent, provider, root)
             run.step_count += 1
             run.prompt_tokens += response.usage.prompt_tokens
             run.completion_tokens += response.usage.completion_tokens
@@ -179,26 +191,58 @@ class Runtime:
                 await self.events.emit(run.id, "tool_call_proposed", tool=c.name, args=c.arguments)
             await self.store.renew_lease(run.id, self.worker_id, self.lease_ttl_s)
 
-    async def _call_model(self, run: Run, agent: Agent, provider: ModelProvider) -> ModelResponse:
+    async def _call_model(
+        self, run: Run, agent: Agent, provider: ModelProvider, root: Span
+    ) -> ModelResponse:
         schemas = [self.registry.get(n).schema() for n in agent.allowed_tools if n in self.registry]
-        return await provider.complete(run.messages, schemas, model=agent.model_config.get("model"))
+        model_name = agent.model_config.get("model")
+        async with self.tracer.span(
+            run.id, "model_call", f"model.{provider.name}", root, step=run.step_count + 1
+        ) as span:
+            t0 = time.perf_counter()
+            response = await provider.complete(run.messages, schemas, model=model_name)
+            latency = time.perf_counter() - t0
+            model = response.model or str(model_name or provider.name)
+            cost = self.prices.cost(model, response.usage)
+            if cost is None:
+                m.UNPRICED_CALLS.labels(model).inc()
+            else:
+                run.est_cost_usd += cost
+                m.COST.labels(model).inc(cost)
+            m.MODEL_LATENCY.labels(model).observe(latency)
+            m.TOKENS.labels(model, "prompt").inc(response.usage.prompt_tokens)
+            m.TOKENS.labels(model, "completion").inc(response.usage.completion_tokens)
+            span.set(
+                model=model,
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                cost_usd=cost if cost is not None else "unknown",
+                finish_reason=response.finish_reason,
+                tool_calls=[c.name for c in response.tool_calls],
+            )
+        return response
 
     def _check_budgets(self, run: Run, agent: Agent) -> RunStatus | None:
         if run.step_count >= agent.max_steps:
             return RunStatus.MAX_STEPS
         if run.prompt_tokens + run.completion_tokens >= agent.max_tokens:
             return RunStatus.BUDGET_EXCEEDED
+        if run.est_cost_usd >= agent.max_cost_usd:
+            return RunStatus.BUDGET_EXCEEDED
         return None
 
     # -- tool calls ------------------------------------------------------------------
 
-    async def _process_calls(self, run: Run, agent: Agent, pending: list[ToolCall]) -> None:
+    async def _process_calls(
+        self, run: Run, agent: Agent, pending: list[ToolCall], root: Span
+    ) -> None:
         for call in pending:
-            obs = await self._handle_call(run, agent, call)
+            async with self.tracer.span(run.id, "tool_call", f"tool.{call.name}", root) as span:
+                obs = await self._handle_call(run, agent, call, span)
             run.messages.append(Message(Role.TOOL, obs, tool_call_id=call.id, name=call.name))
             await self.store.save_progress(run)
 
-    async def _handle_call(self, run: Run, agent: Agent, call: ToolCall) -> str:
+    async def _handle_call(self, run: Run, agent: Agent, call: ToolCall, span: Span) -> str:
         rec = await self.store.get_tool_call(run.id, call.id)
         if rec is not None and rec.status in {"succeeded", "failed", "denied"}:
             # Executed before a crash, but the observation was never persisted.
@@ -217,12 +261,24 @@ class Runtime:
                 "invalid arguments",
                 details=exc.errors(include_url=False, include_context=False),
             )
+        span.set(
+            decision=decision.verdict.value, reason=decision.reason, risk=tool.risk_level.value
+        )
+        m.TOOL_CALLS.labels(call.name, decision.verdict.value).inc()
         if decision.verdict is Verdict.DENY:
             return await self._deny(run, call, decision.reason)
         if decision.verdict is Verdict.APPROVAL:
             await self._request_approval(run, call, tool, decision)
             raise Paused
-        return await self._run_tool(run, call, tool, decision, rec)
+        obs = await self._run_tool(run, call, tool, decision, rec)
+        rec = await self.store.get_tool_call(run.id, call.id)
+        if rec is not None:
+            span.set(status=rec.status, attempts=rec.attempts, tainted=rec.output_tainted)
+            if rec.status == "failed":
+                span.fail(rec.error or "failed")
+            if rec.latency_ms is not None:
+                m.TOOL_LATENCY.labels(call.name).observe(rec.latency_ms / 1000)
+        return obs
 
     async def _request_approval(
         self, run: Run, call: ToolCall, tool: Tool[Any], decision: Decision
@@ -348,6 +404,8 @@ class Runtime:
         return obs
 
     async def _deny(self, run: Run, call: ToolCall, reason: str, *, details: Any = None) -> str:
+        if reason in ("invalid arguments",) or reason.startswith("unknown tool"):
+            m.TOOL_CALLS.labels(call.name, "denied").inc()
         await self.store.upsert_tool_call(
             ToolCallRecord(
                 id=call.id,
@@ -410,6 +468,7 @@ class Runtime:
         run.tainted = True
         signals = injection_signals(observation(output))
         if signals:
+            m.INJECTION_SIGNALS.labels(call.name).inc()
             await self.events.emit(
                 run.id, "injection_suspected", tool=call.name, signals=signals[:5]
             )
@@ -442,6 +501,9 @@ class Runtime:
             current = (await self.store.get_run(run.id)).status
             raise RuntimeError(f"run {run.id} moved to {current} concurrently")
         run.status = target
+        if target.is_terminal:
+            m.RUNS.labels(target.value).inc()
+            m.STEPS_PER_RUN.observe(run.step_count)
         await self.events.emit(run.id, "status", status=target.value)
 
     async def _finish(self, run: Run, status: RunStatus) -> Run:

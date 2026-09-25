@@ -1,0 +1,13 @@
+# Price table used for cost accounting: USD per 1M tokens.
+#
+# IMPORTANT: prices change. Fill these in from each provider's official pricing page
+# and record the source + date next to each entry. `null` means "unknown": cost is then
+# reported as unknown (not zero-cost) in traces and metrics.
+#
+# Model names are matched exactly first, then by longest prefix.
+models:
+  rules-v1:        {input_per_mtok: 0.0, output_per_mtok: 0.0}   # offline fake model
+  scripted:        {input_per_mtok: 0.0, output_per_mtok: 0.0}   # test fake model
+  # gemini-<model>: {input_per_mtok: null, output_per_mtok: null}  # source: <url>, <date>
+  # gpt-<model>:    {input_per_mtok: null, output_per_mtok: null}  # source: <url>, <date>
+  # claude-<model>: {input_per_mtok: null, output_per_mtok: null}  # source: <url>, <date>
