@@ -247,7 +247,7 @@ async def c(tmp_path: Path) -> AsyncIterator[Container]:
         _env_file=None,
     )
     container = build_container(settings)
-    await container.store.create_schema()
+    await container.store.migrate()
     await container.store.grant("acme", "alice", ["web:read", "notes:write", "notes:read"])
     yield container
     await container.close()

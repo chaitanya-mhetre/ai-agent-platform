@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from agentplat.messages import Message
 from agentplat.state import RunStatus, check_transition
+from agentplat.store import migrate as migrations
 from agentplat.store import schema as t
 from agentplat.store.models import Agent, Approval, Run, ToolCallRecord
 
@@ -43,13 +44,24 @@ class SqlStore:
     def from_url(cls, url: str) -> SqlStore:
         return cls(create_async_engine(url, pool_pre_ping=True))
 
-    async def create_schema(self) -> None:
+    async def migrate(self, revision: str = "head") -> None:
+        """Bring the database to `revision` with Alembic (idempotent)."""
         async with self.engine.begin() as conn:
-            await conn.run_sync(t.metadata.create_all)
+            await conn.run_sync(migrations.upgrade, revision)
+
+    async def downgrade(self, revision: str = "base") -> None:
+        async with self.engine.begin() as conn:
+            await conn.run_sync(migrations.downgrade, revision)
+
+    async def schema_revision(self) -> str | None:
+        async with self.engine.connect() as conn:
+            return await conn.run_sync(migrations.current_revision)
 
     async def drop_schema(self) -> None:
+        """Test helper: remove every table, including ones created outside Alembic."""
         async with self.engine.begin() as conn:
             await conn.run_sync(t.metadata.drop_all)
+            await conn.execute(sa.text("DROP TABLE IF EXISTS alembic_version"))
 
     async def close(self) -> None:
         await self.engine.dispose()

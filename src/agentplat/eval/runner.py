@@ -150,7 +150,7 @@ class EvalRunner:
                 await c.close()
 
     async def _run(self, c: Container, item: Item, repeat: int) -> ItemResult:
-        await c.store.create_schema()
+        await c.store.migrate()
         if self.ablate_taint_policy:
             from agentplat.guards import GuardPipeline, PolicyConfig
 

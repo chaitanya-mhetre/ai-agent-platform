@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./agentplat.db"
     redis_url: str | None = None  # None -> in-process queue + event bus (dev only)
-    auto_create_schema: bool = True
+    auto_migrate: bool = True  # run Alembic `upgrade head` on startup (advisory-locked on PG)
     embedded_worker: bool = True  # run a worker inside the API process (dev only)
     worker_concurrency: int = 4
     lease_ttl_s: float = 30.0

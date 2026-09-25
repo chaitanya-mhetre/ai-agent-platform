@@ -44,7 +44,7 @@ services:
     command: ["python", "-m", "agentplat.worker_main"]
     environment:
       <<: *env
-      AGENTPLAT_AUTO_CREATE_SCHEMA: "false"  # the API creates the schema; avoid DDL races
+      AGENTPLAT_AUTO_MIGRATE: "false"  # the API runs migrations; the PG advisory lock makes it safe anyway
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/metrics')"]
       interval: 10s

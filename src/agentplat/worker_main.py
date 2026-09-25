@@ -20,8 +20,8 @@ async def main() -> None:
     settings = Settings()
     c = build_container(settings, worker_id=f"{socket.gethostname()}-{os.getpid()}")
     start_http_server(settings.worker_metrics_port, registry=REGISTRY)
-    if settings.auto_create_schema:
-        await c.store.create_schema()
+    if settings.auto_migrate:
+        await c.store.migrate()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

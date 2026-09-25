@@ -27,7 +27,7 @@ async def main() -> None:
                 _env_file=None,
             )
         )
-        await c.store.create_schema()
+        await c.store.migrate()
         await c.store.grant("acme", "alice", ["web:read", "notes:write", "records:delete"])
         await c.store.grant("acme", "boss", ["approvals:decide"])
         agent = Agent(new_id(), "acme", "demo", "You are helpful.", [t.name for t in c.registry])

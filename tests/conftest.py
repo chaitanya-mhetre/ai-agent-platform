@@ -19,7 +19,7 @@ from agentplat.tools.registry import ToolRegistry
 @pytest.fixture
 async def store(tmp_path: Path) -> AsyncIterator[SqlStore]:
     s = SqlStore.from_url(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await s.create_schema()
+    await s.migrate()
     yield s
     await s.close()
 

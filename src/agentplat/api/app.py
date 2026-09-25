@@ -31,8 +31,8 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         c = container or build_container()
         app.state.container = c
-        if c.settings.auto_create_schema:
-            await c.store.create_schema()
+        if c.settings.auto_migrate:
+            await c.store.migrate()
         await c.bootstrap()
         stop = asyncio.Event()
         worker_task = None

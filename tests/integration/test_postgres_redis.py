@@ -34,7 +34,7 @@ async def pg() -> AsyncIterator[SqlStore]:
     assert PG
     s = SqlStore.from_url(PG)
     await s.drop_schema()
-    await s.create_schema()
+    await s.migrate()
     yield s
     await s.close()
 
@@ -104,3 +104,15 @@ async def test_redis_queue_roundtrip(redis: Redis) -> None:
     await q.enqueue("b")
     assert [await q.dequeue(1), await q.dequeue(1)] == ["a", "b"]
     assert await q.dequeue(1) is None
+
+
+async def test_concurrent_migrations_are_serialized_by_advisory_lock(pg: SqlStore) -> None:
+    """API and worker starting together must not race on DDL."""
+    assert PG
+    other = SqlStore.from_url(PG)
+    try:
+        await pg.downgrade("base")
+        await asyncio.gather(pg.migrate(), other.migrate(), pg.migrate())
+        assert await pg.schema_revision() == "0001"
+    finally:
+        await other.close()
