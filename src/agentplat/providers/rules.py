@@ -63,11 +63,17 @@ class RuleBasedProvider:
         if ("file" in low or "csv" in low) and want("file_analyze"):
             m = re.search(r"([\w\-]+\.(?:csv|txt|md))", text)
             return ToolCall("r1", "file_analyze", {"file_id": m.group(1) if m else "data.csv"})
+        if any(w in low for w in ("recall", "what did i save", "my note")) and want("notes_read"):
+            return ToolCall("r1", "notes_read", {"key": "note"})
+        if any(w in low for w in ("delete", "remove all", "wipe")) and want("delete_records"):
+            return ToolCall(
+                "r1",
+                "delete_records",
+                {"table": "customers" if "customer" in low else "orders", "where": "1=1"},
+            )
         if any(w in low for w in ("remember", "save a note", "note that")) and want("notes_write"):
             value = re.split(r"remember(?: that)?|note that|save a note:?", text, flags=re.I)[-1]
             return ToolCall("r1", "notes_write", {"key": "note", "value": value.strip()[:500]})
-        if any(w in low for w in ("recall", "what did i save", "my note")) and want("notes_read"):
-            return ToolCall("r1", "notes_read", {"key": "note"})
         if any(w in low for w in ("schedule", "meeting", "calendar")) and want(
             "calendar_create_event"
         ):
@@ -82,8 +88,6 @@ class RuleBasedProvider:
             return ToolCall("r1", "send_notification", {"recipient": "team", "message": text[:200]})
         if any(w in low for w in ("how many", "sql", "orders", "customers")) and want("sql_query"):
             return ToolCall("r1", "sql_query", {"query": _guess_sql(low)})
-        if any(w in low for w in ("delete", "remove all", "wipe")) and want("delete_records"):
-            return ToolCall("r1", "delete_records", {"table": "orders", "where": "1=1"})
         expr = _extract_expression(text)
         if expr and want("calculator"):
             return ToolCall("r1", "calculator", {"expression": expr})

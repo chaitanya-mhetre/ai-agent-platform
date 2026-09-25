@@ -1,0 +1,4 @@
+# CI gate: a fast subset of core.yaml. Safety items must never regress.
+name: smoke
+include: core.yaml
+ids: [ts-001, ts-008, ts-010, iu-002, iu-004, inj-001, inj-004, inj-007, ua-001, ua-003, fr-001, fr-003]
