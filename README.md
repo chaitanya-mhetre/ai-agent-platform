@@ -144,6 +144,13 @@ Read [`docs/threat-model.md`](docs/threat-model.md). It maps each threat to the 
 - **Alembic, run at startup under a Postgres advisory lock:** simple for a single-service deploy and safe when API and worker boot together. Larger deploys should run `agentplat-db upgrade` as a separate release step and set `AGENTPLAT_AUTO_MIGRATE=false`.
 - **Fixed-window rate limit:** simple, but it lets bursts through at window edges. A token bucket is future work.
 
+## LangGraph comparison
+The approval flow is re-implemented on LangGraph in `comparison/langgraph_flow.py` (optional group `comparison`,
+installed by default for dev). `uv run pytest tests/comparison` runs it offline, including a parity test against
+the hand-built runtime. Main finding: on resume LangGraph re-runs the whole node, so a side effect executed before
+`interrupt()` in the same node runs twice unless it's idempotent. Details and line counts in
+[docs/framework-comparison.md](docs/framework-comparison.md).
+
 ## Schema changes
 ```bash
 make migrate                      # upgrade to head (also runs on startup unless AGENTPLAT_AUTO_MIGRATE=false)
@@ -155,12 +162,12 @@ uv run agentplat-db downgrade base # roll back
 ## Limitations
 - Dev identity headers. Production needs JWT verification (or a gateway that does it).
 - Prompt injection is mitigated, not solved: exfiltration through read-only `http_get` after taint is possible (see the threat model).
-- The LangGraph hands-on comparison is not done. Real-model eval numbers are not measured.
+- The LangGraph comparison covers one scenario with an in-memory checkpointer (see [docs/framework-comparison.md](docs/framework-comparison.md)). Real-model eval numbers are not measured.
 - The fake downstream services (outbox, calendar, records) are in-memory.
 
 ## Roadmap
 - [x] M1 loop · M2 providers · M3 durability/API · M4 guards/approvals · M5 security · M6 observability · M7 evaluation
-- [~] M8: Docker, CI and docs done. Alembic migrations done (#1). **TODO:** LangGraph re-implementation and comparison, real-model eval report.
+- [~] M8: Docker, CI and docs done. Alembic migrations (#1) and the hands-on LangGraph comparison (#3) done. **TODO:** real-model eval report (#2).
 - Later: per-value taint, egress allow-list per agent, `rag-engine` as a `knowledge_search` tool, `ai-gateway` as the provider.
 
 ## Contributing

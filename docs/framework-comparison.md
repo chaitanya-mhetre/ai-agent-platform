@@ -1,47 +1,88 @@
 # Hand-written runtime vs. LangGraph
 
-**Status: design comparison only.** The spec (M8) calls for re-implementing one scenario in LangGraph and
-comparing the two hands-on. That part has **not been built yet** (tracked in the README roadmap). This doc
-compares the designs, using the LangGraph documentation (checked Sep 2026 through the official docs:
-`docs.langchain.com/oss/python/langgraph`).
+**Status: hands-on comparison done for one scenario** (issue #3). The "risky tools need a human"
+flow is re-implemented on LangGraph in [`comparison/langgraph_flow.py`](../comparison/langgraph_flow.py),
+with tests in [`tests/comparison/test_langgraph_flow.py`](../tests/comparison/test_langgraph_flow.py).
+Versions: `langgraph` 1.2.12, `langchain-core` 1.6.5 (optional dependency group `comparison`).
 
-## How the concepts map
+Both versions share the same model providers (`ScriptedProvider`), tools (`delete_records`,
+`send_notification`, `calendar_create_event`) and fake services, so the comparison isolates orchestration.
+Everything here was run offline with the scripted model; no model-quality claims.
 
-| Concern | agentplat (this repo) | LangGraph |
+## What was built on LangGraph
+
+```
+START -> agent --(tool calls and steps < max)--> tools -> agent ... -> END
+```
+- `agent` node: calls the provider, appends the assistant message.
+- `tools` node: for each proposed call, allow-list ∩ user permissions → schema validation → approval gate
+  (`interrupt()`) → execute with a timeout and an idempotency key.
+- `InMemorySaver` checkpointer, keyed by `thread_id`; resume with `Command(resume={"decision": ...})`.
+
+## Results
+
+| Check (same scenario, same scripted model) | Hand-built | LangGraph |
 |---|---|---|
-| Control flow | Explicit `while` loop in `Runtime._drive`: model → guard → executor → observation | A `StateGraph` of nodes and edges (e.g. `agent` node ↔ `tools` node with a conditional edge) |
-| State | `Run` row: messages, counters, `tainted` flag, status (explicit state machine in `state.py`) | Typed `State` dict with reducers (e.g. `Annotated[list, add]`), versioned per step |
-| Durability | Persist the proposal *before* executing; persist every observation; leases + reclaimer for dead workers | A **checkpointer** (e.g. `InMemorySaver`, Postgres/Redis savers) records state at every super-step, keyed by `thread_id` |
-| Resume after crash | Another worker re-derives unanswered calls from persisted messages; idempotency keys stop duplicate side effects | Invoke again with the same `thread_id` (and `None` input) to continue from the last checkpoint |
-| Human approval | Guard returns `needs_approval` → `approvals` row → run → `awaiting_approval`; the approvals API re-queues the run | `interrupt(payload)` inside a node pauses the graph (needs a checkpointer); resume with `Command(resume=value)` |
-| Retries / timeouts | `ToolExecutor`: per-tool timeout, retries only for transient errors | Node-level retry policies. Per the docs, `interrupt()` bypasses retry policies and error handlers |
-| Authorization | Execution-time guard pipeline (schema → allow-list ∩ user permissions → policy → approval) | Not built in: you write it in the tools node (or wrap tools) |
-| Prompt-injection policy | Taint flag on the run and escalation to approval | Not built in: same, custom node logic |
-| Observability | Own span tree in Postgres + OTel export + Prometheus | Integrates with LangSmith; OTel possible through LangChain callbacks |
-| Evaluation | `agent-eval`: deterministic suites, ablations | LangSmith evaluations (hosted), or your own harness |
+| Destructive call pauses, runs exactly once after approval | ✅ | ✅ |
+| Rejection becomes an observation and the run continues | ✅ | ✅ |
+| Missing permission → denied without asking a human | ✅ | ✅ (written by hand in the node) |
+| Tool not on allow-list → denied | ✅ | ✅ (written by hand in the node) |
+| Extra arguments rejected | ✅ | ✅ (reuses `ToolArgs extra="forbid"`) |
+| Same final status, output and side effects (parity test) | ✅ | ✅ |
+| Side effect executed *before* the interrupt in the same step | runs once (proposal + record persisted before execution) | **runs twice**; single effect only because of the idempotency key |
 
-## Trade-offs
+### The finding worth remembering
+`test_side_effects_before_interrupt_rerun_on_resume`: one model turn proposes a calendar write (no approval
+needed) and a delete (approval needed). On LangGraph the calendar tool **executes again** when the graph
+resumes, because `interrupt()` resumes by re-running the whole node from the top (documented behaviour).
+The fake calendar still ends with one event only because every call carries an idempotency key
+(`sha256(thread_id, call_id, name, args)`). Without that key, the side effect would duplicate.
 
-**Why hand-write it here?** The project exists to show understanding of the *mechanics*: when state
-gets persisted, why a proposal is saved before execution, how leases stop double execution, and where
-authorization has to happen. With a framework, those decisions still exist, but they're buried in library defaults.
+The hand-built runtime avoids the re-run structurally: each call's outcome is persisted in `tool_calls`
+before moving on, and a resumed run only processes calls without an observation (`unanswered_calls`).
 
-**Where LangGraph would win:**
-- Complex graphs: branching sub-agents, parallel fan-out and map-reduce patterns are declarative instead of hand-coded.
-- Batteries included: checkpointer backends, streaming modes, time-travel over checkpoints, a studio UI.
-- Team familiarity: many teams already know it, so it's cheaper to hire and onboard for.
+Fixes on LangGraph: make every side effect idempotent (as here), put side-effecting calls in their own node
+after the approval node, or split into one node per call.
 
-**Where the hand-written runtime wins:**
-- Security controls are first-class and testable in isolation (`guards.py`, `security/`). In a framework they'd be glue code inside a node.
-- Exactly-once side effects are explicit (idempotency key = f(run, call id, args)). A checkpointer alone doesn't give you this: a node that crashes after the side effect and before the checkpoint will re-run it.
-- Only a few dependencies, and every line can be explained in an interview.
+## Size (code lines, excluding blank lines, comments and docstrings)
 
-**A subtle point worth knowing (interview material):** with checkpoint-based resumption, the unit of replay is
-the *node*. When an interrupted node resumes, it runs again from the start, so any side effect *before*
-`interrupt()` in that node would repeat. The usual fix is the same one used here: put side effects after the
-approval point, or make them idempotent.
+| | Lines | Covers |
+|---|---|---|
+| `comparison/langgraph_flow.py` | 162 | loop, authz, validation, approval pause/resume, timeout, idempotency key, driver |
+| `orchestrator.py` + `guards.py` + `approvals.py` + `runtime/executor.py` + `runtime/worker.py` + `state.py` | 464 + 93 + 49 + 54 + 66 + 44 = 770 | the above **plus** durable run rows and leases, crash-safe resume across processes, retries with backoff, taint escalation, loop detection, budgets (steps/tokens/cost), output validation and caps, audit log, tracing spans, cancellation, edit-and-approve |
 
-## TODO (hands-on part)
-- [ ] Re-implement the "destructive tool needs approval" scenario as a LangGraph `StateGraph` with a Postgres checkpointer.
-- [ ] Run the same `smoke` suite through both and compare pass rate, lines of code, and behaviour on a crash mid-tool.
-- [ ] Record what each needs in order to add taint escalation.
+The ~4.7× difference is mostly features the LangGraph version doesn't have, not framework savings.
+A fair estimate: LangGraph removes the loop, state persistence and pause/resume plumbing (roughly the
+`_drive`/`execute`/`Paused` and approval re-queue code, ~150–200 lines). The security and correctness
+controls would be the same size either way.
+
+## Control, tracing, testability
+
+- **Permissions and approval:** LangGraph has no authorization model. All checks live inside the `tools`
+  node as custom code, same as the hand-built guard pipeline, just less isolated (the hand-built
+  `GuardPipeline` is testable without running the loop).
+- **Approval semantics:** `interrupt()` is elegant for the happy path. But approval state lives in the
+  checkpoint, not a queryable `approvals` table, so "list all pending approvals for tenant X" or an
+  approvals API needs an extra store or a scan over threads. Edit-and-approve needs extra resume payload logic.
+- **Durability:** the checkpointer saves state per super-step. Cross-process crash recovery needs a
+  persistent saver (Postgres/SQLite packages) plus something to *notice* a dead run and re-invoke it; the
+  hand-built lease + reclaimer does that. Not tested here (in-memory saver only).
+- **Tracing:** the hand-built runtime writes its own span tree and OTel spans. LangGraph integrates with
+  LangSmith or LangChain callbacks; the comparison version has no tracing.
+- **Testability:** both are easy to test offline with a scripted model. LangGraph state is inspectable via
+  `aget_state()` (`snapshot.interrupts`, `snapshot.next`), which made the tests short.
+
+## When I'd choose which
+
+- **LangGraph:** multi-step graphs with branching, sub-agents, parallel fan-out, or when the team already uses
+  it; prototypes where the checkpointer + interrupt primitives save weeks.
+- **Hand-built:** when approval, authorization and audit are product features (queryable, multi-tenant),
+  and when exactly-once side effects and crash recovery must be explained and tested explicitly.
+
+Either way, the rules are the same: authorize at execution time, never before-interrupt side effects without
+idempotency, and treat the model's output as an untrusted proposal.
+
+## Not done
+- A persistent checkpointer (Postgres/SQLite) and a real crash-mid-tool test on the LangGraph side.
+- Taint escalation on LangGraph (it would be another custom check in the `tools` node).
+- Running the full `smoke` eval suite through the LangGraph version (the suite drives `Runtime` directly).

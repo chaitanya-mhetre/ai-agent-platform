@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Hands-on LangGraph comparison: the approval flow on a `StateGraph` with `interrupt()`/`Command(resume=...)`
+  (`comparison/langgraph_flow.py`, optional dependency group `comparison`), 7 tests including a parity test with
+  the hand-built runtime and the resume re-run gotcha; `docs/framework-comparison.md` rewritten with results. (#3)
 ### Changed
 - Schema is managed by Alembic (revision `0001`) instead of `metadata.create_all`. API and worker run
   `upgrade head` on startup under a Postgres advisory lock; `AGENTPLAT_AUTO_CREATE_SCHEMA` is renamed to
