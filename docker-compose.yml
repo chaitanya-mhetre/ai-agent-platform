@@ -34,7 +34,7 @@ services:
       AGENTPLAT_OPENAI_API_KEY: ${AGENTPLAT_OPENAI_API_KEY:-}
       AGENTPLAT_ANTHROPIC_API_KEY: ${AGENTPLAT_ANTHROPIC_API_KEY:-}
       AGENTPLAT_OTEL_ENDPOINT: ${AGENTPLAT_OTEL_ENDPOINT:-}
-    ports: ["8000:8000"]
+    ports: ["${AGENTPLAT_API_PORT:-8000}:8000"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -42,9 +42,14 @@ services:
   worker:
     build: .
     command: ["python", "-m", "agentplat.worker_main"]
-    environment: *env
+    environment:
+      <<: *env
+      AGENTPLAT_AUTO_CREATE_SCHEMA: "false"  # the API creates the schema; avoid DDL races
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/metrics')"]
+      interval: 10s
     depends_on:
-      postgres: {condition: service_healthy}
+      api: {condition: service_healthy}
       redis: {condition: service_healthy}
     deploy:
       replicas: 2

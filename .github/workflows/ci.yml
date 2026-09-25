@@ -1,0 +1,57 @@
+name: ci
+on:
+  push: {branches: [main, master]}
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest -q
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: {POSTGRES_USER: agent, POSTGRES_PASSWORD: agent, POSTGRES_DB: agent}
+        ports: ["55434:5432"]
+        options: --health-cmd "pg_isready -U agent" --health-interval 2s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["56381:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-retries 20
+    env:
+      AGENTPLAT_TEST_PG_URL: postgresql+asyncpg://agent:agent@localhost:55434/agent
+      AGENTPLAT_TEST_REDIS_URL: redis://localhost:56381/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run pytest -q -m integration
+
+  eval-smoke:
+    # Regression gate on runtime safety behaviour (offline model, no API keys, no cost).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run agent-eval run suites/smoke.yaml --min-pass-rate 1.0 --out eval-out
+      - uses: actions/upload-artifact@v4
+        with: {name: eval-smoke-report, path: eval-out/}
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t agentplat:ci .
+      - name: secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env: {GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
